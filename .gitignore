@@ -1,0 +1,30 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+
+# Model Checkpoints & Large weights (>10MB)
+checkpoints/*.pt
+checkpoints/*.pth
+*.pt
+*.pth
+
+# Downloaded raw PDB files
+predictions/*.ent
+predictions/*.pdb
+
+# Environment & IDE
+.env
+.venv
+env/
+venv/
+ENV/
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Logs
+logs/*.log
