@@ -55,37 +55,36 @@ class SpatialPatchConv(nn.Module):
 
 class MUSEModule(nn.Module):
     """
-    MUSE (Multi-scale Attention Network) Module (Section II-F).
-    Fuses topological diffusion information and geometric context by summing three parallel branches:
-      1. Self-Attention Branch (Eq. 18): captures global long-range residue dependencies.
-      2. Multi-Scale Convolution Branch (Eq. 19-20): depthwise separable convolutions with
-         kernel sizes {1, 3, 5} along the residue dimension, dynamically weighted.
-         [In Rectified mode: augmented with 3D Spatial Surface Patch Convolution].
-      3. Position-wise Feed-Forward Network (Eq. 21): residue-level transformation.
+    Multi-Scale Feature Fusion Module (Section II-F).
+    Combines:
+      1. Residue-level Self-Attention (Branch 1)
+      2. Multi-Scale Convolutions (Branch 2):
+         - 1D Depthwise Separable Convolutions across sequence lengths (kernels 1, 3, 5)
+         - Optional 3D Spatial Surface Patch Convolution (Gap 3 rectification)
+      3. Position-wise Feed-Forward Network (Branch 3)
 
-    Fused output (Eq. 22):
-      Zmuse = Attention(Z) + Conv(Z) + Pointwise(Z)
+    Ablation:
+      - wo_muse: replaced by simple linear projection in SGAP-PPIS
     """
     def __init__(
         self,
-        in_dim=768,      # (T + 1) * da = 6 * 128 = 768
+        in_dim=768,      # Z in R^(N x 768) where 768 = 640 (APPNP) + 128 (EGNN summary J)
         hidden_dim=256,
-        num_heads=1,
         kernel_sizes=(1, 3, 5),
-        dropout=0.3,
-        use_spatial_patch=False  # Gap 3 Rectification
+        num_heads=4,
+        dropout=0.1,
+        use_spatial_patch=False
     ):
         super(MUSEModule, self).__init__()
         self.in_dim = in_dim
         self.hidden_dim = hidden_dim
         self.use_spatial_patch = use_spatial_patch
-
-        # Linear projections for Value matrix used across attention and conv branches
-        self.W_V = nn.Linear(in_dim, hidden_dim)
+        self.num_heads = num_heads
 
         # Branch 1: Self-Attention (Eq. 18)
         self.W_Q = nn.Linear(in_dim, hidden_dim)
         self.W_K = nn.Linear(in_dim, hidden_dim)
+        self.W_V = nn.Linear(in_dim, hidden_dim)
         self.W_O = nn.Linear(hidden_dim, hidden_dim)
         self.scale = (hidden_dim // num_heads) ** -0.5
         self.attn_dropout = nn.Dropout(dropout)
@@ -113,33 +112,33 @@ class MUSEModule(nn.Module):
             nn.Linear(in_dim, hidden_dim * 2),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(hidden_dim * 2, hidden_dim),
-            nn.Dropout(dropout)
+            nn.Linear(hidden_dim * 2, hidden_dim)
         )
 
+        # Output Layer Normalization (Eq. 22)
         self.norm = nn.LayerNorm(hidden_dim)
 
     def forward(self, Z, norm_adj=None):
         """
         Args:
-            Z: (N, in_dim=768) concatenated representation [H_out || J]
-            norm_adj: (N, N) spatial contact adjacency (used if use_spatial_patch=True)
+            Z: (N, in_dim=768) concatenated representation from dual branches
+            norm_adj: (N, N) optional normalized contact matrix for 3D patch conv
         Returns:
-            Z_muse: (N, hidden_dim) fused representation
+            Z_muse: (N, hidden_dim=256) fused multi-scale representation
         """
         N = Z.size(0)
 
-        # Shared Value projection: Z W_V
+        # Projections
+        Q = self.W_Q(Z)  # (N, hidden_dim)
+        K = self.W_K(Z)  # (N, hidden_dim)
         V = self.W_V(Z)  # (N, hidden_dim)
 
         # -------------------------------------------------------------
         # Branch 1: Self-Attention (Eq. 18)
         # -------------------------------------------------------------
-        Q = self.W_Q(Z)  # (N, hidden_dim)
-        K = self.W_K(Z)  # (N, hidden_dim)
-
-        attn_scores = torch.matmul(Q, K.t()) * self.scale  # (N, N)
-        attn_probs = F.softmax(attn_scores, dim=-1)
+        # Attention scores: Softmax(Q K^T / sqrt(d_k)) V
+        scores = torch.matmul(Q, K.t()) * self.scale  # (N, N)
+        attn_probs = F.softmax(scores, dim=-1)
         attn_probs = self.attn_dropout(attn_probs)
         attn_out = self.W_O(torch.matmul(attn_probs, V))  # (N, hidden_dim)
 
@@ -161,7 +160,8 @@ class MUSEModule(nn.Module):
             conv_outputs.append(spatial_out)
 
         # Dynamically weighted combination using normalized beta weights (Eq. 20)
-        beta_weights = F.softmax(self.beta, dim=0)
+        # Sliced to active conv outputs to prevent routing probability leakage
+        beta_weights = F.softmax(self.beta[:len(conv_outputs)], dim=0)
         weighted_conv = torch.zeros_like(conv_outputs[0])
         for i, c_out in enumerate(conv_outputs):
             weighted_conv = weighted_conv + beta_weights[i] * c_out
@@ -180,4 +180,3 @@ class MUSEModule(nn.Module):
         Z_muse = self.norm(Z_muse)
 
         return Z_muse
-

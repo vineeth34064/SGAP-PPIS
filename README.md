@@ -4,6 +4,7 @@
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.x-ee4c2c.svg)](https://pytorch.org/)
 [![SE(3) Equivariant](https://img.shields.io/badge/SE(3)-Equivariant-green.svg)](https://arxiv.org/abs/2102.09844)
 [![Benchmark Tests](https://img.shields.io/badge/Tests-9%2F9%20Passing-brightgreen.svg)](test_suite.py)
+[![EGM Certified](https://img.shields.io/badge/EGM%20Audit-Passed%20&%20Remediated-success.svg)](EGM_AUDIT_REPORT.md)
 [![Paper](https://img.shields.io/badge/arXiv-2606.01781-B31B1B.svg)](https://arxiv.org/abs/2606.01781)
 
 A complete, production-grade PyTorch implementation of the research paper:
@@ -335,6 +336,19 @@ To open the dashboard, open [`visualization/dashboard.html`](visualization/dashb
 ```powershell
 Start-Process visualization\dashboard.html
 ```
+
+---
+
+## Elephant-Goldfish Model (EGM) Audit & Engineering Remediation
+
+This codebase underwent an independent, adversarial dual-agent audit using the **Elephant-Goldfish Model (EGM)** framework:
+- **EGM Design Critic (`egm-design`)**: High-altitude scalability, memory bottlenecks, molecular realism, and edge-case failure modes.
+- **EGM Technical Quality Auditor (`egm-codebase-details`)**: Mathematical compliance, line-by-line contract audits, and parameter validation against arXiv:2606.01781.
+
+All 14 identified architectural findings (including silent inference corruption, logit dimension crashes during calibration, self-loop double-counting, and surface penalty gradient thrashing) have been fully remediated and validated in the test suite.
+
+For the full critique report, mathematical proofs, and remediation details, see:  
+👉 **[EGM_AUDIT_REPORT.md](EGM_AUDIT_REPORT.md)**
 
 ---
 

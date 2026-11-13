@@ -91,60 +91,67 @@ class AdaptiveAPPNPBranch(nn.Module):
         Args:
             x: (N, in_dim=62) node feature matrix
             norm_adj: (N, N) symmetrically normalized adjacency matrix
-            egnn_states: list of S^(k) from EGNN, each (N, da)
+            egnn_states: list of K states [S^(1), ..., S^(K)], each (N, da)
             egnn_summary_J: (N, da) multi-scale geometric summary J
-            edge_index: (2, M) optional for dynamic coupling
-            edge_att_layers: optional list of edge attention weights per EGNN layer
+            edge_index: (2, M) optional edge indices
+            edge_att_layers: list of K edge attention vectors, each (M, 1)
         Returns:
             dict containing:
-              - 'H_out': (N, T * da) concatenated multi-step representations
-              - 'all_H': list of all propagation states [H_a^(0), ..., H_a^(T)]
-              - 'all_alpha': list of propagation coefficients per step
+              - 'H_out': (N, T * da) concatenated intermediate propagation states
+              - 'all_H': list of states at each step [H_0, H_1, ..., H_T]
+              - 'all_alpha': list of propagation coefficient tensors at each step
         """
         N = x.size(0)
 
-        # Eq. 10: Root representation H_a^(0)
-        H_root = self.root_proj(x)
+        # Eq. 10: Initial root feature H_a^(0)
+        H_root = self.root_proj(x)  # (N, da)
         H_current = H_root
 
         H_steps = []
         all_alpha = []
 
         for t in range(self.num_appnp_layers):
-            # Scale alignment (Eq. 11 & Eq. 12)
+            # Scale alignment (Eq. 11-12)
             if self.scale_align:
                 scale_idx = self._get_scale_index(t)
-                S_aligned = egnn_states[scale_idx]
-                C_t = 0.5 * (S_aligned + egnn_summary_J)
+                S_k = egnn_states[scale_idx]
+                C_t = 0.5 * (S_k + egnn_summary_J)  # Eq. 12: C^(t) = 0.5 * (S^(idx(t)) + J)
             else:
-                # Ablation w/o ScaleAlign: uniform shared geometric summary
+                # Ablation w/o ScaleAlign: uses shared global geometric summary J
                 C_t = egnn_summary_J
 
-            # Propagation coefficient alpha^(t)
+            # Teleportation coefficient alpha^(t)
             if self.fixed_alpha is not None:
-                # Ablation SGAP_Fixed_alpha
-                alpha_t = torch.full((N, 1), float(self.fixed_alpha), device=x.device, dtype=x.dtype)
+                # SGAP_Fixed_alpha ablation setting
+                alpha_t = torch.full((N, 1), self.fixed_alpha, device=x.device, dtype=x.dtype)
             else:
-                # Eq. 13 & 14: Adaptive residue-wise propagation coefficient
-                alpha_raw = self.alpha_mlp(C_t)  # (N, 1) or (N, da)
+                # Dynamic adaptive generation (Eq. 13-14)
+                # alpha_tilde in [0, 1] via Sigmoid
+                alpha_tilde = self.alpha_mlp(C_t)  # (N, da) if anisotropic else (N, 1)
+                # Linear rescaling to [alpha_min, alpha_max] (Eq. 14)
+                alpha_raw = self.alpha_min + (self.alpha_max - self.alpha_min) * alpha_tilde
                 alpha_t = torch.clamp(alpha_raw, min=self.alpha_min, max=self.alpha_max)
 
             all_alpha.append(alpha_t)
 
             # Adjacency matrix for step t
             # If dynamic coupling (Gap 2): modulate normalized adjacency with scale-aligned EGNN states
-            if self.dynamic_coupling and edge_index is not None and edge_att_layers is not None:
+            if self.dynamic_coupling and edge_index is not None and edge_att_layers is not None and hasattr(self, 'edge_mod_mlp'):
                 scale_idx = self._get_scale_index(t)
                 att_t = edge_att_layers[scale_idx]  # (M, 1)
-                # Form modulated adjacency
+                node_gate = self.edge_mod_mlp(C_t)  # (N, 1)
+                edge_mod = att_t * 0.5 * (node_gate[edge_index[0]] + node_gate[edge_index[1]])
+
                 adj_mod = torch.zeros(N, N, device=x.device, dtype=x.dtype)
-                adj_mod[edge_index[0], edge_index[1]] = att_t.squeeze(-1)
-                # Symmetrize and combine with base norm_adj
+                adj_mod[edge_index[0], edge_index[1]] = edge_mod.squeeze(-1)
                 adj_mod = 0.5 * (adj_mod + adj_mod.t())
-                cur_adj = 0.7 * norm_adj + 0.3 * adj_mod
-                # Re-normalize row sums
-                deg_inv_sqrt = torch.pow(cur_adj.sum(dim=-1).clamp(min=1e-6), -0.5)
-                cur_adj = deg_inv_sqrt.unsqueeze(-1) * cur_adj * deg_inv_sqrt.unsqueeze(0)
+                # Add self-loops to modulated adjacency and symmetrically normalize
+                adj_mod = adj_mod + torch.eye(N, device=x.device, dtype=x.dtype)
+                deg_inv_sqrt = torch.pow(adj_mod.sum(dim=-1).clamp(min=1e-6), -0.5)
+                norm_adj_mod = deg_inv_sqrt.unsqueeze(-1) * adj_mod * deg_inv_sqrt.unsqueeze(0)
+
+                # Convex combination of two valid normalized diffusion operators
+                cur_adj = 0.7 * norm_adj + 0.3 * norm_adj_mod
             else:
                 cur_adj = norm_adj
 
@@ -161,7 +168,7 @@ class AdaptiveAPPNPBranch(nn.Module):
             H_out = torch.cat(H_steps, dim=-1)
         else:
             # Ablation w/o Multi-Step Concat: uses only the final APPNP output H_a^(T)
-            # Replicated T times to match the downstream expected dimension
+            # Replicated T times to match downstream expected dimension
             H_out = torch.cat([H_steps[-1]] * self.num_appnp_layers, dim=-1)
 
         return {
@@ -169,4 +176,3 @@ class AdaptiveAPPNPBranch(nn.Module):
             'all_H': [H_root] + H_steps,
             'all_alpha': all_alpha
         }
-

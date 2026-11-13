@@ -25,7 +25,7 @@ class FocalLoss(nn.Module):
             logits: (N, 2) or (N, 1) or (N,) unnormalized logits
             targets: (N,) binary ground truth {0, 1}
             rsa: (N,) Relative Solvent Accessibility from DSSP (optional, for Gap 7 rectification)
-            surface_penalty_weight: float weight for penalizing buried interaction predictions
+            surface_penalty_weight: float weight for penalizing buried false-positive interaction predictions
         """
         targets = targets.float().view(-1)
         if logits.dim() == 2 and logits.size(1) == 2:
@@ -41,14 +41,16 @@ class FocalLoss(nn.Module):
         loss = - phi_t * modulating_factor * torch.log(p_t)
 
         # Gap 7 Rectification: Surface Feasibility Penalty
-        # Buried residues (RSA < 0.05 or 0.10) predicting high interaction probability
+        # Buried non-binding residues (RSA < 0.05 and targets == 0) predicting high interaction probability
         # receive an auxiliary biophysical consistency penalty.
+        # Conditioned on (1.0 - targets) to prevent destructive gradient conflict on true active sites in deep pockets.
+        # Guarded by torch.any(rsa > 0.0) to avoid false penalty if DSSP file was absent.
         if rsa is not None and surface_penalty_weight > 0.0:
             rsa = rsa.view(-1)
-            buried_mask = (rsa < 0.05).float()
-            # Penalty for high positive prediction on buried residues
-            surface_penalty = buried_mask * (p_pos ** 2)
-            loss = loss + surface_penalty_weight * surface_penalty
+            if torch.any(rsa > 0.0):
+                buried_non_binding = (rsa < 0.05).float() * (1.0 - targets)
+                surface_penalty = buried_non_binding * (p_pos ** 2)
+                loss = loss + surface_penalty_weight * surface_penalty
 
         if self.reduction == 'mean':
             return loss.mean()
@@ -56,4 +58,3 @@ class FocalLoss(nn.Module):
             return loss.sum()
         else:
             return loss
-

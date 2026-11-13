@@ -1,5 +1,7 @@
 import os
 import sys
+import gzip
+import shutil
 import argparse
 import numpy as np
 import pandas as pd
@@ -35,8 +37,17 @@ def get_centroid(residue):
 
 def parse_pdb_chain(pdb_file, chain_id):
     """Parse structure, filter standard residues, extract centroids and sequence."""
+    # Decompress if gzipped (.gz or .ent.gz)
+    actual_path = pdb_file
+    if pdb_file.endswith('.gz'):
+        uncompressed_path = pdb_file[:-3]
+        if not os.path.exists(uncompressed_path):
+            with gzip.open(pdb_file, 'rb') as f_in, open(uncompressed_path, 'wb') as f_out:
+                shutil.copyfileobj(f_in, f_out)
+        actual_path = uncompressed_path
+
     parser = PDBParser(QUIET=True)
-    structure = parser.get_structure('protein', pdb_file)
+    structure = parser.get_structure('protein', actual_path)
     model = structure[0]
     if chain_id not in model:
         raise KeyError(f"Chain '{chain_id}' not found in {pdb_file}. Available: {[c.id for c in model]}")
@@ -44,24 +55,38 @@ def parse_pdb_chain(pdb_file, chain_id):
     chain = model[chain_id]
     residues = [r for r in chain if r.id[0] == ' ' and r.get_resname().strip() in AA_3TO1]
     if not residues:
-        raise ValueError(f"No standard amino acid residues found in chain {chain_id}")
+        raise ValueError(f"No standard amino acid residues found in chain '{chain_id}'.")
 
     seq = "".join([AA_3TO1[r.get_resname().strip()] for r in residues])
     res_ids = [r.id[1] for r in residues]
     res_names = [r.get_resname().strip() for r in residues]
+    pos = np.array([get_centroid(r) for r in residues], dtype=np.float32)
 
-    coords = [get_centroid(r) for r in residues]
-    pos = np.vstack(coords)  # (N, 3)
     return seq, res_ids, res_names, pos
 
 def normalize_adjacency(adj):
+    """
+    Symmetric normalization of adjacency with self-loops:
+    A_hat = D^(-1/2) (A + I_N) D^(-1/2)
+    Enforces diagonal elements strictly equal 1.0 (no double-counting of self-loops).
+    """
     N = adj.shape[0]
-    adj_loop = adj + np.eye(N, dtype=np.float32)
+    adj_loop = np.copy(adj).astype(np.float32)
+    np.fill_diagonal(adj_loop, 1.0)
     rowsum = adj_loop.sum(axis=1)
     r_inv = np.power(rowsum, -0.5)
     r_inv[np.isinf(r_inv)] = 0.0
     r_mat_inv = np.diag(r_inv)
     return r_mat_inv @ adj_loop @ r_mat_inv
+
+def align_len(arr, target_len):
+    """Safely pad or truncate feature arrays to match sequence length."""
+    if arr.shape[0] > target_len:
+        return arr[:target_len]
+    elif arr.shape[0] < target_len:
+        pad = np.zeros((target_len - arr.shape[0], arr.shape[1]), dtype=arr.dtype)
+        return np.vstack([arr, pad])
+    return arr
 
 def main():
     parser = argparse.ArgumentParser(description="SGAP-PPIS Protein Interaction Site Predictor")
@@ -71,6 +96,10 @@ def main():
     parser.add_argument('--model_mode', type=str, default='rectified', choices=['baseline', 'rectified'])
     parser.add_argument('--threshold', type=float, default=0.5, help="Classification probability threshold")
     parser.add_argument('--cutoff', type=float, default=14.0, help="Spatial distance cutoff threshold in Angstroms")
+    parser.add_argument('--use_plm', action='store_true', help="Use ESM-2 language model embeddings (Gap 4)")
+    parser.add_argument('--feature_dir', type=str, default=None, help="Directory containing precomputed .npy features")
+    parser.add_argument('--allow_dummy_features', action='store_true',
+                        help="Allow mock geometric features for offline dry-run testing only (issues warning)")
     parser.add_argument('--out_dir', type=str, default='./predictions', help="Output directory")
     args = parser.parse_args()
 
@@ -104,6 +133,8 @@ def main():
     norm_adj_tensor = torch.from_numpy(norm_adj.astype(np.float32))
 
     src_nodes, dst_nodes = np.where(adj_mask == 1.0)
+    non_self = (src_nodes != dst_nodes)
+    src_nodes, dst_nodes = src_nodes[non_self], dst_nodes[non_self]
     edge_index = torch.tensor(np.stack([src_nodes, dst_nodes], axis=0), dtype=torch.long)
 
     # Edge features
@@ -117,25 +148,59 @@ def main():
     edge_feats = np.stack([edge_dists, norm_cos], axis=1).astype(np.float32)
     edge_attr_tensor = torch.from_numpy(edge_feats)
 
-    # 62D node features (using positional embedding + pseudo-features if standalone)
+    # 62D node features
     ppe = np.linalg.norm(pos_centered, axis=-1, keepdims=True) / 15.0  # (N, 1)
-    # Check if precomputed features exist in Feature directory
-    pid = f"{os.path.basename(pdb_path)[:4]}{args.chain}"
-    feat_base = "./Feature" if os.path.exists("./Feature") else "../gte-ppis/Feature"
 
-    if os.path.exists(os.path.join(feat_base, "dssp", f"{pid}.npy")):
-        print(f"Loading cached features for {pid}...")
-        dssp = np.load(os.path.join(feat_base, "dssp", f"{pid}.npy"))[:N]
-        pssm = np.load(os.path.join(feat_base, "pssm", f"{pid}.npy"))[:N]
-        hmm = np.load(os.path.join(feat_base, "hmm", f"{pid}.npy"))[:N]
-        resaf = np.load(os.path.join(feat_base, "resAF", f"{pid}.npy"))[:N]
-        x_62 = np.concatenate([pssm, hmm, dssp, resaf, ppe], axis=1).astype(np.float32)
+    # Locate precomputed features
+    base_pdb = os.path.basename(pdb_path).lower()
+    if base_pdb.startswith('pdb'):
+        code = base_pdb[3:7]
     else:
-        # Fallback pseudo-features
-        print("Note: Computing geometric node representations...")
-        dummy_evol = np.random.normal(0, 0.1, (N, 40)).astype(np.float32)
-        dummy_struct = np.random.normal(0, 0.1, (N, 21)).astype(np.float32)
+        code = base_pdb[:4]
+    pid = f"{code}{args.chain}"
+    possible_feat_dirs = [
+        args.feature_dir,
+        "./Feature",
+        "../gte-ppis/Feature"
+    ]
+    feat_base = None
+    for f_dir in possible_feat_dirs:
+        if f_dir and os.path.exists(os.path.join(f_dir, "dssp", f"{pid}.npy")):
+            feat_base = f_dir
+            break
+
+    plm_tensor = None
+    if feat_base is not None:
+        print(f"Loading precomputed biophysical features for {pid} from {feat_base}...")
+        dssp = align_len(np.load(os.path.join(feat_base, "dssp", f"{pid}.npy")), N)
+        pssm = align_len(np.load(os.path.join(feat_base, "pssm", f"{pid}.npy")), N)
+        hmm = align_len(np.load(os.path.join(feat_base, "hmm", f"{pid}.npy")), N)
+        resaf = align_len(np.load(os.path.join(feat_base, "resAF", f"{pid}.npy")), N)
+        x_62 = np.concatenate([pssm, hmm, dssp, resaf, ppe], axis=1).astype(np.float32)
+
+        if args.use_plm:
+            esm_path = os.path.join(feat_base, "esm2", f"{pid}.npy")
+            if os.path.exists(esm_path):
+                esm = align_len(np.load(esm_path).astype(np.float32), N)
+                plm_tensor = torch.from_numpy(esm).to(device)
+            else:
+                plm_tensor = torch.zeros((N, 1280), dtype=torch.float32, device=device)
+    else:
+        if not args.allow_dummy_features:
+            raise FileNotFoundError(
+                f"Missing precomputed features for protein '{pid}'.\n"
+                f"SGAP-PPIS requires 62D handcrafted features (PSSM, HMM, DSSP, resAF) in `./Feature`.\n"
+                f"To test inference pipeline in dry-run mode, pass `--allow_dummy_features` explicitly."
+            )
+        print("\n" + "!" * 70)
+        print(" [WARNING] Running in DRY-RUN mode with mock geometric node features (--allow_dummy_features).")
+        print(" Outputs generated are strictly mock demonstrations and not valid biophysical predictions.")
+        print("!" * 70 + "\n")
+        dummy_evol = np.zeros((N, 40), dtype=np.float32)
+        dummy_struct = np.zeros((N, 21), dtype=np.float32)
         x_62 = np.concatenate([dummy_evol, dummy_struct, ppe], axis=1).astype(np.float32)
+        if args.use_plm:
+            plm_tensor = torch.zeros((N, 1280), dtype=torch.float32, device=device)
 
     x_tensor = torch.from_numpy(x_62)
 
@@ -147,7 +212,8 @@ def main():
         da=128,
         num_egnn_layers=5,
         num_appnp_layers=5,
-        rectified=is_rectified
+        rectified=is_rectified,
+        use_plm=args.use_plm
     ).to(device)
 
     if args.checkpoint and os.path.exists(args.checkpoint):
@@ -155,7 +221,6 @@ def main():
         model.load_state_dict(ckpt['model_state_dict'])
         print(f"Loaded trained checkpoint: {args.checkpoint}")
     else:
-        # Look in checkpoints directory
         ckpt_dir = "./checkpoints"
         if os.path.exists(ckpt_dir):
             ckpts = [f for f in os.listdir(ckpt_dir) if f.endswith('.pt') and f"sgap_{args.model_mode}" in f]
@@ -172,7 +237,8 @@ def main():
             pos_tensor.to(device),
             edge_index.to(device),
             edge_attr_tensor.to(device),
-            norm_adj_tensor.to(device)
+            norm_adj_tensor.to(device),
+            plm_feats=plm_tensor
         )
         probs = out['probs'][:, 1].cpu().numpy()
         preds = (probs >= args.threshold).astype(int)
@@ -223,4 +289,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-

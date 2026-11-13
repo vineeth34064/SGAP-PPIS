@@ -6,9 +6,9 @@ import json
 import numpy as np
 import torch
 import torch.optim as optim
-from torch.utils.data import Subset, DataLoader
+from torch.utils.data import Subset
 
-from data.dataset import PPISDataset, ppis_collate_fn
+from data.dataset import PPISDataset
 from models.sgap_ppis import SGAP_PPIS
 from losses.focal_loss import FocalLoss
 from utils.metrics import compute_all_metrics, find_optimal_threshold
@@ -40,6 +40,8 @@ def parse_args():
     parser.add_argument('--use_plm', action='store_true', help="Use ESM-2 language model embeddings (Gap 4)")
     parser.add_argument('--surface_penalty', type=float, default=0.0, help="Surface feasibility loss weight (Gap 7)")
     parser.add_argument('--coord_noise', type=float, default=0.0, help="Coordinate perturbation noise std (Gap 8)")
+    parser.add_argument('--data_dir', type=str, default=None, help="Path to Dataset directory")
+    parser.add_argument('--feature_dir', type=str, default=None, help="Path to Feature directory")
     parser.add_argument('--save_dir', type=str, default='./checkpoints', help="Directory to save checkpoints")
     parser.add_argument('--log_dir', type=str, default='./logs', help="Directory to save logs")
     return parser.parse_args()
@@ -48,15 +50,13 @@ def set_seed(seed):
     np.random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
-        torch.cuda.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
 
-def evaluate_dataset(model, dataset, device, batch_size=1):
+def evaluate_dataset(model, dataset, device, temp_scaler=None):
     model.eval()
     all_targets = []
     all_probs = []
-    all_pids = []
-    all_rsa = []
+    all_logits = []
 
     with torch.no_grad():
         for i in range(len(dataset)):
@@ -70,21 +70,26 @@ def evaluate_dataset(model, dataset, device, batch_size=1):
             plm = sample['plm'].to(device) if sample.get('plm') is not None else None
 
             out = model(x, pos, edge_index, edge_attr, norm_adj, plm_feats=plm)
-            probs = out['probs'][:, 1].cpu().numpy()  # probability of interacting class (class 1)
+            logits = out['logits']
+
+            if temp_scaler is not None:
+                probs = temp_scaler.calibrate_probs(logits).cpu().numpy()
+            else:
+                probs = torch.softmax(logits, dim=-1)[:, 1].cpu().numpy()
 
             all_targets.extend(y.tolist())
             all_probs.extend(probs.tolist())
-            all_pids.append(sample['pid'])
-            if 'rsa' in sample:
-                all_rsa.extend(sample['rsa'].numpy().tolist())
+            all_logits.append(logits.cpu())
 
-    return np.array(all_targets), np.array(all_probs), all_pids, np.array(all_rsa)
+    all_logits_tensor = torch.cat(all_logits, dim=0) if all_logits else None
+    return np.array(all_targets), np.array(all_probs), all_logits_tensor, {}
 
 def train_epoch(model, dataset, optimizer, criterion, device, surface_penalty=0.0):
     model.train()
     total_loss = 0.0
-    indices = np.random.permutation(len(dataset))
 
+    # Shuffle training indices
+    indices = np.random.permutation(len(dataset))
     for idx in indices:
         sample = dataset[idx]
         x = sample['x'].to(device)
@@ -92,13 +97,15 @@ def train_epoch(model, dataset, optimizer, criterion, device, surface_penalty=0.
         edge_index = sample['edge_index'].to(device)
         edge_attr = sample['edge_attr'].to(device)
         norm_adj = sample['norm_adj'].to(device)
-        y = sample['y'].to(device)
-        rsa = sample['rsa'].to(device) if 'rsa' in sample else None
+        targets = sample['y'].to(device)
+        rsa = sample['rsa'].to(device) if sample.get('rsa') is not None else None
         plm = sample['plm'].to(device) if sample.get('plm') is not None else None
 
         optimizer.zero_grad()
         out = model(x, pos, edge_index, edge_attr, norm_adj, plm_feats=plm)
-        loss = criterion(out['logits'], y, rsa=rsa, surface_penalty_weight=surface_penalty)
+        logits = out['logits']
+
+        loss = criterion(logits, targets, rsa=rsa, surface_penalty_weight=surface_penalty)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
         optimizer.step()
@@ -153,7 +160,7 @@ def train_fold(
             surface_penalty=args.surface_penalty if is_rectified else 0.0
         )
 
-        val_targets, val_probs, _, _ = evaluate_dataset(model, val_subset, device)
+        val_targets, val_probs, val_logits, _ = evaluate_dataset(model, val_subset, device)
         val_metrics = compute_all_metrics(val_targets, val_probs)
         val_auprc = val_metrics['AUPRC']
         val_mcc = val_metrics['MCC']
@@ -167,14 +174,31 @@ def train_fold(
             best_val_auprc = val_auprc
             best_epoch = epoch
             patience_counter = 0
+
+            # 1. Post-hoc temperature calibration fit on validation logits (Gap 6)
+            temp_scaler = TemperatureScaling().to(device)
+            try:
+                fitted_temp = temp_scaler.fit(val_logits.to(device), torch.tensor(val_targets).to(device), max_iter=20)
+            except Exception:
+                fitted_temp = 1.0
+
+            # 2. Derive calibrated validation probabilities
+            val_probs_calibrated = temp_scaler.calibrate_probs(val_logits.to(device)).cpu().numpy()
+
+            # 3. Find optimal decision threshold on CALIBRATED probabilities (Gap 6)
+            opt_thresh, opt_mcc = find_optimal_threshold(val_targets, val_probs_calibrated, metric='MCC')
+
             torch.save({
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'val_metrics': val_metrics,
+                'optimal_threshold': opt_thresh,
+                'optimal_mcc': opt_mcc,
+                'temperature': fitted_temp,
                 'args': vars(args)
             }, checkpoint_path)
-            print(f"  --> [*] Best validation AUPRC achieved ({best_val_auprc:.4f}). Checkpoint saved.")
+            print(f"  --> [*] Best validation AUPRC achieved ({best_val_auprc:.4f}, Opt Thresh: {opt_thresh:.2f}, Temp: {fitted_temp:.2f}). Checkpoint saved.")
         else:
             patience_counter += 1
             # Learning rate decay strategy: reduced by 70% if val AUPRC does not improve for 5 consecutive epochs
@@ -198,8 +222,11 @@ def main():
     os.makedirs(args.log_dir, exist_ok=True)
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Running SGAP-PPIS on Device: {device}")
-    print(f"Arguments: {json.dumps(vars(args), indent=2)}")
+    print("=================================================================")
+    print(f" SGAP-PPIS Training Pipeline")
+    print(f" Mode: {args.model_mode.upper()}, Ablation: {args.ablation}")
+    print(f" Device: {device}, Folds: {args.folds}, Epochs/fold: {args.epochs}")
+    print("=================================================================")
 
     exp_name = f"sgap_{args.model_mode}_{args.ablation}"
     if args.fixed_alpha is not None:
@@ -208,15 +235,17 @@ def main():
     # Load Train_335-1 dataset
     train_dataset = PPISDataset(
         split='Train_335-1',
+        data_dir=args.data_dir,
+        feature_dir=args.feature_dir,
         load_plm=args.use_plm,
         coord_noise_std=args.coord_noise if args.model_mode == 'rectified' else 0.0
     )
     print(f"Loaded Train_335-1 with {len(train_dataset)} proteins.")
 
     # Load Test Sets for final reporting
-    test60_ds = PPISDataset(split='Test_60', load_plm=args.use_plm)
-    test315_ds = PPISDataset(split='Test_315-28', load_plm=args.use_plm)
-    ubtest31_ds = PPISDataset(split='UBtest_31-6', load_plm=args.use_plm)
+    test60_ds = PPISDataset(split='Test_60', data_dir=args.data_dir, feature_dir=args.feature_dir, load_plm=args.use_plm)
+    test315_ds = PPISDataset(split='Test_315-28', data_dir=args.data_dir, feature_dir=args.feature_dir, load_plm=args.use_plm)
+    ubtest31_ds = PPISDataset(split='UBtest_31-6', data_dir=args.data_dir, feature_dir=args.feature_dir, load_plm=args.use_plm)
 
     if args.smoke_test:
         print("[!] SMOKE TEST MODE: Truncating datasets to small subsets.")
@@ -276,8 +305,15 @@ def main():
                 use_plm=args.use_plm
             ).to(device)
             eval_model.load_state_dict(ckpt_data['model_state_dict'])
-            targets, probs, _, _ = evaluate_dataset(eval_model, test_ds, device)
-            metrics = compute_all_metrics(targets, probs)
+
+            temp_scaler = None
+            if args.model_mode == 'rectified' and 'temperature' in ckpt_data:
+                temp_scaler = TemperatureScaling(init_temp=ckpt_data['temperature']).to(device)
+
+            eval_threshold = ckpt_data.get('optimal_threshold', 0.5) if (args.model_mode == 'rectified') else 0.5
+
+            targets, probs, _, _ = evaluate_dataset(eval_model, test_ds, device, temp_scaler=temp_scaler)
+            metrics = compute_all_metrics(targets, probs, threshold=eval_threshold)
             test_metrics_list.append(metrics)
 
         # Average metrics across evaluated checkpoints
@@ -295,4 +331,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-

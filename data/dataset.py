@@ -29,6 +29,7 @@ class PPISDataset(Dataset):
         self.dist_norm = dist_norm
         self.load_plm = load_plm
         self.coord_noise_std = coord_noise_std
+        self._cache = {}
 
         # Locate dataset directory
         possible_data_dirs = [
@@ -104,9 +105,11 @@ class PPISDataset(Dataset):
         """
         Symmetric normalization of adjacency with self-loops:
         A_hat = D^(-1/2) (A + I_N) D^(-1/2)
+        Enforces diagonal elements strictly equal 1.0 (no double-counting of self-loops).
         """
         N = adj.shape[0]
-        adj_loop = adj + np.eye(N, dtype=np.float32)
+        adj_loop = np.copy(adj).astype(np.float32)
+        np.fill_diagonal(adj_loop, 1.0)
         rowsum = adj_loop.sum(axis=1)
         r_inv = np.power(rowsum, -0.5)
         r_inv[np.isinf(r_inv)] = 0.0
@@ -115,6 +118,9 @@ class PPISDataset(Dataset):
         return torch.from_numpy(norm_adj.astype(np.float32))
 
     def __getitem__(self, index):
+        if self.coord_noise_std == 0.0 and index in self._cache:
+            return self._cache[index]
+
         pid = self.protein_ids[index]
         seq = self.sequences[index]
         lbl = self.labels[index]
@@ -189,11 +195,13 @@ class PPISDataset(Dataset):
         adj_mask = (dmap >= 0) & (dmap <= self.cutoff)
         adj_matrix = adj_mask.astype(np.float32)
 
-        # Symmetrically normalized adjacency matrix
+        # Symmetrically normalized adjacency matrix (strictly 1.0 on diagonal)
         norm_adj_tensor = self._normalize_adjacency(adj_matrix)
 
-        # Edge index (src, dst)
+        # Edge index (src, dst) excluding self-loops so neighbor degree |N(i)| is exact in EGNN
         src_nodes, dst_nodes = np.where(adj_matrix == 1.0)
+        non_self = (src_nodes != dst_nodes)
+        src_nodes, dst_nodes = src_nodes[non_self], dst_nodes[non_self]
         edge_index = torch.tensor(np.stack([src_nodes, dst_nodes], axis=0), dtype=torch.long)
 
         # 4. Edge Features (Equation Section II-C3: normalized distance and normalized cosine similarity)
@@ -229,7 +237,7 @@ class PPISDataset(Dataset):
 
         label_tensor = torch.tensor(lbl, dtype=torch.long)
 
-        return {
+        sample = {
             'pid': pid,
             'seq': seq,
             'x': node_feats_tensor,          # (N, 62)
@@ -242,6 +250,11 @@ class PPISDataset(Dataset):
             'plm': plm_tensor                # (N, 1280) if load_plm else None
         }
 
+        if self.coord_noise_std == 0.0:
+            self._cache[index] = sample
+
+        return sample
+
 def ppis_collate_fn(batch):
     """
     Collate function for PPIS data loader.
@@ -251,4 +264,3 @@ def ppis_collate_fn(batch):
     if len(batch) == 1:
         return batch[0]
     return batch
-
